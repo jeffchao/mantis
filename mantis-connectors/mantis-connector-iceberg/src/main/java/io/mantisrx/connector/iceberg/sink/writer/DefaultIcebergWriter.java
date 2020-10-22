@@ -67,20 +67,17 @@ public class DefaultIcebergWriter implements IcebergWriter {
     private OutputFile file;
     private StructLike partitionKey;
 
-    public DefaultIcebergWriter(
-            WriterConfig config,
-            WorkerInfo workerInfo,
-            Table table,
-            LocationProvider locationProvider) {
+    public static Builder newBuilder() {
+        return new Builder();
+    }
 
-        this.config = config;
-
-        this.workerInfo = workerInfo;
-        this.table = table;
+    private DefaultIcebergWriter(Builder builder) {
+        this.config = builder.config;
+        this.workerInfo = builder.workerInfo;
+        this.table = builder.table;
+        this.locationProvider = builder.locationProvider;
         this.spec = table.spec();
         this.format = FileFormat.valueOf(config.getWriterFileFormat());
-
-        this.locationProvider = locationProvider;
     }
 
     /**
@@ -218,5 +215,40 @@ public class DefaultIcebergWriter implements IcebergWriter {
         }
 
         return String.format("/%s/%s", spec.partitionToPath(partitionKey), filename);
+    }
+
+    public static final class Builder {
+
+        private WriterConfig config;
+        private WorkerInfo workerInfo;
+        private Table table;
+        private LocationProvider locationProvider;
+
+        private Builder() {
+        }
+
+        public Builder withConfig(WriterConfig val) {
+            this.config = val;
+            return this;
+        }
+
+        public Builder withWorkerInfo(WorkerInfo val) {
+            this.workerInfo = val;
+            return this;
+        }
+
+        public Builder withTable(Table val) {
+            this.table = val;
+            return this;
+        }
+
+        public Builder withLocationProvider(LocationProvider val) {
+            this.locationProvider = val;
+            return this;
+        }
+
+        public IcebergWriter build() {
+            return new DefaultIcebergWriter(this);
+        }
     }
 }

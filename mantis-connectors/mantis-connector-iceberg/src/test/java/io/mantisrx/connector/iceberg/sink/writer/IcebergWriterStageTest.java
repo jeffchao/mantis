@@ -63,6 +63,7 @@ class IcebergWriterStageTest {
     private Catalog catalog;
     private Table table;
     private Context context;
+    private DefaultIcebergWriter.Builder writerBuilder;
     private IcebergWriter writer;
     private Partitioner partitioner;
     private Observable<DataFile> flow;
@@ -82,13 +83,15 @@ class IcebergWriterStageTest {
         Parameters parameters = StageOverrideParameters.newParameters();
         WriterConfig config = new WriterConfig(parameters, mock(Configuration.class));
         WriterMetrics metrics = new WriterMetrics();
+        this.writerBuilder = mock(DefaultIcebergWriter.Builder.class);
         this.writer = spy(FakeIcebergWriter.class);
+        when(writerBuilder.build()).thenReturn(this.writer);
         this.partitioner = mock(Partitioner.class);
         when(this.writer.length()).thenReturn(Long.MAX_VALUE);
         this.transformer = new IcebergWriterStage.Transformer(
                 config,
                 metrics,
-                this.writer,
+                this.writerBuilder,
                 this.partitioner,
                 this.scheduler,
                 this.scheduler);

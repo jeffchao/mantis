@@ -114,12 +114,16 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
         WorkerInfo workerInfo = context.getWorkerInfo();
 
         LocationProvider locationProvider = context.getServiceLocator().service(LocationProvider.class);
-        IcebergWriter writer = new DefaultIcebergWriter(config, workerInfo, table, locationProvider);
+        DefaultIcebergWriter.Builder writerBuilder = DefaultIcebergWriter.newBuilder()
+                .withConfig(config)
+                .withWorkerInfo(workerInfo)
+                .withTable(table)
+                .withLocationProvider(locationProvider);
         WriterMetrics metrics = new WriterMetrics();
         PartitionerFactory partitionerFactory = context.getServiceLocator().service(PartitionerFactory.class);
         Partitioner partitioner = partitionerFactory.getPartitioner(table);
 
-        return new Transformer(config, metrics, writer, partitioner, Schedulers.computation(), Schedulers.io());
+        return new Transformer(config, metrics, writerBuilder, partitioner, Schedulers.computation(), Schedulers.io());
     }
 
     public IcebergWriterStage() {
@@ -168,21 +172,21 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
 
         private final WriterConfig config;
         private final WriterMetrics metrics;
+        private final DefaultIcebergWriter.Builder writerBuilder;
         private final Partitioner partitioner;
-        private final IcebergWriter writer;
         private final Scheduler timerScheduler;
         private final Scheduler transformerScheduler;
 
         public Transformer(
                 WriterConfig config,
                 WriterMetrics metrics,
-                IcebergWriter writer,
+                DefaultIcebergWriter.Builder writerBuilder,
                 Partitioner partitioner,
                 Scheduler timerScheduler,
                 Scheduler transformerScheduler) {
             this.config = config;
             this.metrics = metrics;
-            this.writer = writer;
+            this.writerBuilder = writerBuilder;
             this.partitioner = partitioner;
             this.timerScheduler = timerScheduler;
             this.transformerScheduler = transformerScheduler;
@@ -203,14 +207,14 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
          * closing the current file, opening a new file, and writing the record to that new file.
          * <p>
          * It's _important_ that upstream producers align events to partitions as best as possible. For example,
-         * - Given an Iceberg Table partitioned by {@code hour}
+         * - given an Iceberg Table partitioned by {@code hour}
          * - 10 producers writing Iceberg Records
          * <p>
          * Each of the 10 producers _should_ try to produce events aligned by the hour.
          * If writes are not well-aligned, then results will be correct, but performance negatively impacted due to
          * frequent opening/closing of files.
          * <p>
-         * Writes may be _unordered_ as long as they're aligned by the table's partitioning.
+         * Writes may be _unordered_ as long as they're relatively aligned by the table's partitioning.
          * <p>
          * Size Threshold:
          * <p>
@@ -230,102 +234,110 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
          */
         @Override
         public Observable<DataFile> call(Observable<Record> source) {
-            Observable<Record> timer = Observable.interval(
-                    config.getWriterFlushFrequencyMsec(), TimeUnit.MILLISECONDS, timerScheduler)
-                    .map(i -> TIMER_RECORD);
+            return Observable.defer(() -> {
+                Observable<Record> timer = Observable.interval(
+                        config.getWriterFlushFrequencyMsec(), TimeUnit.MILLISECONDS, timerScheduler)
+                        .map(i -> TIMER_RECORD);
 
-            return source.mergeWith(timer)
-                    .observeOn(transformerScheduler)
-                    .scan(new Trigger(config.getWriterRowGroupSize()), (trigger, record) -> {
-                        if (record.struct().fields().equals(TIMER_SCHEMA.columns())) {
-                            trigger.timeout();
-                        } else {
-                            StructLike partition = partitioner.partition(record);
-                            // Only open (if closed) on new events from `source`; exclude timer records.
-                            if (writer.isClosed()) {
-                                try {
-                                    logger.info("opening file for partition {}", partition);
-                                    writer.open(partition);
+                IcebergWriter writer = writerBuilder.build();
+
+                return source.mergeWith(timer)
+                        .observeOn(transformerScheduler)
+                        .scan(new Trigger(config.getWriterRowGroupSize(), config.getWriterFlushFrequencyBytes()), (trigger, record) -> {
+                            if (record.struct().fields().equals(TIMER_SCHEMA.columns())) {
+                                trigger.timeout();
+                            } else {
+                                StructLike partition = partitioner.partition(record);
+                                // Only open (if closed) on new events from `source`; exclude timer records.
+                                logger.info("[{}] Writing record {}", Thread.currentThread().getName(), record);
+                                if (writer.isClosed()) {
+                                    try {
+                                        logger.info("opening file for partition {}", partition);
+                                        writer.open(partition);
+                                        trigger.setPartition(partition);
+                                        metrics.increment(WriterMetrics.OPEN_SUCCESS_COUNT);
+                                    } catch (IOException e) {
+                                        metrics.increment(WriterMetrics.OPEN_FAILURE_COUNT);
+                                        throw Exceptions.propagate(e);
+                                    }
+                                }
+
+                                // Make sure records are aligned with the partition.
+                                if (trigger.isNewPartition(partition)) {
                                     trigger.setPartition(partition);
-                                    metrics.increment(WriterMetrics.OPEN_SUCCESS_COUNT);
-                                } catch (IOException e) {
-                                    metrics.increment(WriterMetrics.OPEN_FAILURE_COUNT);
-                                    throw Exceptions.propagate(e);
+
+                                    try {
+                                        DataFile dataFile = writer.close();
+                                        trigger.stage(dataFile);
+                                        trigger.reset();
+                                    } catch (IOException | RuntimeException e) {
+                                        metrics.increment(WriterMetrics.BATCH_FAILURE_COUNT);
+                                        logger.error("error writing DataFile", e);
+                                    }
+
+                                    try {
+                                        logger.info("opening file for new partition {}", partition);
+                                        writer.open(partition);
+                                        metrics.increment(WriterMetrics.OPEN_SUCCESS_COUNT);
+                                    } catch (IOException e) {
+                                        metrics.increment(WriterMetrics.OPEN_FAILURE_COUNT);
+                                        throw Exceptions.propagate(e);
+                                    }
+                                }
+
+                                try {
+                                    writer.write(record);
+                                    trigger.increment();
+                                    metrics.increment(WriterMetrics.WRITE_SUCCESS_COUNT);
+                                } catch (RuntimeException e) {
+                                    metrics.increment(WriterMetrics.WRITE_FAILURE_COUNT);
+                                    logger.error("error writing record {}\n{}", record, e);
                                 }
                             }
 
-                            // Make sure records are aligned with the partition.
-                            if (trigger.isNewPartition(partition)) {
-                                trigger.setPartition(partition);
-
-                                try {
-                                    DataFile dataFile = writer.close();
-                                    trigger.stage(dataFile);
-                                    trigger.reset();
-                                } catch (IOException | RuntimeException e) {
-                                    metrics.increment(WriterMetrics.BATCH_FAILURE_COUNT);
-                                    logger.error("error writing DataFile", e);
-                                }
-
-                                try {
-                                    logger.info("opening file for new partition {}", partition);
-                                    writer.open(partition);
-                                    metrics.increment(WriterMetrics.OPEN_SUCCESS_COUNT);
-                                } catch (IOException e) {
-                                    metrics.increment(WriterMetrics.OPEN_FAILURE_COUNT);
-                                    throw Exceptions.propagate(e);
-                                }
+                            return trigger;
+                        })
+                        .filter(trigger -> trigger.shouldFlush(writer.length()))
+                        // Writer can be closed if there are no events, yet timer is still ticking.
+                        .filter(trigger -> !writer.isClosed())
+                        .map(trigger -> {
+                            // Triggered by new partition.
+                            if (trigger.hasStagedDataFile()) {
+                                DataFile dataFile = trigger.getStagedDataFile().copy();
+                                trigger.clearStagedDataFile();
+                                return dataFile;
                             }
 
+                            // Triggered by size or time.
                             try {
-                                writer.write(record);
-                                trigger.increment();
-                                metrics.increment(WriterMetrics.WRITE_SUCCESS_COUNT);
-                            } catch (RuntimeException e) {
-                                metrics.increment(WriterMetrics.WRITE_FAILURE_COUNT);
-                                logger.debug("error writing record {}", record);
+                                DataFile dataFile = writer.close();
+                                trigger.reset();
+                                return dataFile;
+                            } catch (IOException | RuntimeException e) {
+                                metrics.increment(WriterMetrics.BATCH_FAILURE_COUNT);
+                                logger.error("error writing DataFile", e);
+                                return ERROR_DATA_FILE;
                             }
-                        }
-
-                        return trigger;
-                    })
-                    .filter(this::shouldFlush)
-                    // Writer can be closed if there are no events, yet timer is still ticking.
-                    .filter(trigger -> !writer.isClosed())
-                    .map(trigger -> {
-                        // Triggered by new partition.
-                        if (trigger.hasStagedDataFile()) {
-                            DataFile dataFile = trigger.getStagedDataFile().copy();
-                            trigger.clearStagedDataFile();
-                            return dataFile;
-                        }
-
-                        // Triggered by size or time.
-                        try {
-                            DataFile dataFile = writer.close();
-                            trigger.reset();
-                            return dataFile;
-                        } catch (IOException | RuntimeException e) {
-                            metrics.increment(WriterMetrics.BATCH_FAILURE_COUNT);
-                            logger.error("error writing DataFile", e);
-                            return ERROR_DATA_FILE;
-                        }
-                    })
-                    .filter(dataFile -> !isErrorDataFile(dataFile))
-                    .doOnNext(dataFile -> {
-                        metrics.increment(WriterMetrics.BATCH_SUCCESS_COUNT);
-                        logger.info("writing DataFile: {}", dataFile);
-                        metrics.setGauge(WriterMetrics.BATCH_SIZE, dataFile.recordCount());
-                        metrics.setGauge(WriterMetrics.BATCH_SIZE_BYTES, dataFile.fileSizeInBytes());
-                    })
-                    .doOnTerminate(() -> {
-                        try {
-                            logger.info("closing writer on rx terminate signal");
-                            writer.close();
-                        } catch (IOException e) {
-                            throw Exceptions.propagate(e);
-                        }
-                    });
+                        })
+                        .filter(dataFile -> !isErrorDataFile(dataFile))
+                        .doOnNext(dataFile -> {
+                            metrics.increment(WriterMetrics.BATCH_SUCCESS_COUNT);
+                            logger.info("writing DataFile: {}", dataFile);
+                            metrics.setGauge(WriterMetrics.BATCH_SIZE, dataFile.recordCount());
+                            metrics.setGauge(WriterMetrics.BATCH_SIZE_BYTES, dataFile.fileSizeInBytes());
+                        })
+                        .doOnTerminate(() -> {
+                            try {
+                                logger.info("closing writer on rx terminate signal");
+                                writer.close();
+                            } catch (IOException e) {
+                                throw Exceptions.propagate(e);
+                            }
+                        })
+                        .doOnUnsubscribe(() -> logger.info("unsubscribed from iceberg writer transformer"))
+                        .doOnSubscribe(() -> logger.info("subscribed to iceberg writer transformer"))
+                        .share();
+            });
         }
 
         private boolean isErrorDataFile(DataFile dataFile) {
@@ -334,28 +346,19 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
                     ERROR_DATA_FILE.recordCount() == dataFile.recordCount();
         }
 
-        /**
-         * Trigger a flush on a repartition event, size threshold, or time threshold.
-         */
-        private boolean shouldFlush(Trigger trigger) {
-            // For size threshold, check the trigger to short-circuit if the count is over the threshold first
-            // because implementations of `writer.length()` may be expensive if called in a tight loop.
-            return trigger.hasStagedDataFile()
-                    || (trigger.isOverCountThreshold() && writer.length() >= config.getWriterFlushFrequencyBytes())
-                    || trigger.isTimedOut();
-        }
-
         private static class Trigger {
 
             private final int countThreshold;
+            private final long sizeThreshold;
 
             private int counter;
             private boolean timedOut;
             private StructLike partition;
             private DataFile stagedDataFile;
 
-            Trigger(int countThreshold) {
+            Trigger(int countThreshold, long sizeThreshold) {
                 this.countThreshold = countThreshold;
+                this.sizeThreshold = sizeThreshold;
             }
 
             void increment() {
@@ -377,6 +380,17 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
 
             void stage(DataFile dataFile) {
                 this.stagedDataFile = dataFile;
+            }
+
+            /**
+             * Trigger a flush on a repartition event, size threshold, or time threshold.
+             */
+            private boolean shouldFlush(long size) {
+                // For size threshold, check the trigger to short-circuit if the count is over the threshold first
+                // because implementations of `writer.length()` may be expensive if called in a tight loop.
+                return hasStagedDataFile()
+                        || (isOverCountThreshold() && size >= sizeThreshold)
+                        || isTimedOut();
             }
 
             boolean isOverCountThreshold() {
@@ -407,6 +421,7 @@ public class IcebergWriterStage implements ScalarComputation<Record, DataFile> {
             public String toString() {
                 return "Trigger{"
                         + " countThreshold=" + countThreshold
+                        + ", sizeThreshold=" + sizeThreshold
                         + ", counter=" + counter
                         + ", timedOut=" + timedOut
                         + ", partition=" + partition
